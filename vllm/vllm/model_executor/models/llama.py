@@ -53,22 +53,36 @@ from vllm.utils import is_hip
 from .interfaces import SupportsLoRA, SupportsPP
 from .utils import (AutoWeightsLoader, PPMissingLayer, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers)
+                    
+import pynvml
+import threading
+import nvtx
 
 
 prefill_attn_event_list=[]
 prefill_mlp_event_list=[]
 decode_attn_event_list=[]
 decode_mlp_event_list=[]
+decode_time_event_list=[]
+decode_energy = []
 
 def modify_list():
     global prefill_attn_event_list
     global prefill_mlp_event_list 
     global decode_attn_event_list
     global decode_mlp_event_list
+    global decode_time_event_list
+    global decode_energy
     prefill_attn_event_list.clear()
     prefill_mlp_event_list.clear()
     decode_attn_event_list.clear()
     decode_mlp_event_list.clear()
+    decode_time_event_list.clear()
+    decode_energy.clear()
+
+def set_gpu_clock(device_handle,min_clock, max_clock):
+    pynvml.nvmlDeviceSetGpuLockedClocks(device_handle, min_clock, max_clock)
+    # print(f"GPU frequency changed to {min_clock} MHz.")
 
 class LlamaMLP(nn.Module):
 
@@ -197,11 +211,21 @@ class LlamaAttention(nn.Module):
     ) -> torch.Tensor:
         start_attn_event = torch.cuda.Event(enable_timing=True)
         stop_attn_event = torch.cuda.Event(enable_timing=True)
+        
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
+        # if attn_metadata.decode_metadata !=None:
+        #     # pynvml.nvmlInit()
+        #     device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        #     torch.cuda.synchronize()
+        #     threading.Thread(target=set_gpu_clock,
+        #                         args=(device_handle, 1200, 1400)).start()
+            # pynvml.nvmlDeviceSetGpuLockedClocks(device_handle, 1200, 1400)
+        
         start_attn_event.record()
-        attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
+        for _ in range(1):
+            attn_output = self.attn(q, k, v, kv_cache, attn_metadata)
         stop_attn_event.record()
         if attn_metadata.prefill_metadata!=None:
             prefill_attn_event_list.append((start_attn_event,stop_attn_event))
@@ -279,7 +303,10 @@ class LlamaDecoderLayer(nn.Module):
         
         start_mlp_event = torch.cuda.Event(enable_timing=True)
         stop_mlp_event = torch.cuda.Event(enable_timing=True)
-        
+        # if attn_metadata.decode_metadata !=None:
+        #     pynvml.nvmlInit()
+        #     device_handle = pynvml.nvmlDeviceGetHandleByIndex(1)
+        #     pynvml.nvmlDeviceSetGpuLockedClocks(device_handle, 1200, 1400)
         hidden_states = self.self_attn(positions=positions,
                                        hidden_states=hidden_states,
                                        kv_cache=kv_cache,
@@ -340,6 +367,7 @@ class LlamaModel(nn.Module):
         self.make_empty_intermediate_tensors = (
             make_empty_intermediate_tensors_factory(
                 ["hidden_states", "residual"], config.hidden_size))
+        self.handle = pynvml.nvmlDeviceGetHandleByIndex(1)
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -353,31 +381,53 @@ class LlamaModel(nn.Module):
         intermediate_tensors: Optional[IntermediateTensors],
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        if get_pp_group().is_first_rank:
-            if inputs_embeds is not None:
-                hidden_states = inputs_embeds
+        with nvtx.annotate("Target Code Section", color="blue"):
+            if attn_metadata.prefill_metadata is None:
+                decode_start_power = pynvml.nvmlDeviceGetPowerUsage(self.handle)
+            
+            start_event = torch.cuda.Event(enable_timing=True)
+            stop_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            
+            if get_pp_group().is_first_rank:
+                if inputs_embeds is not None:
+                    hidden_states = inputs_embeds
+                else:
+                    hidden_states = self.get_input_embeddings(input_ids)
+                residual = None
             else:
-                hidden_states = self.get_input_embeddings(input_ids)
-            residual = None
-        else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
-    
-        for i in range(self.start_layer, self.end_layer):
-            layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches[i - self.start_layer],
-                                            attn_metadata, residual)
-        
-        if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
+                assert intermediate_tensors is not None
+                hidden_states = intermediate_tensors["hidden_states"]
+                residual = intermediate_tensors["residual"]
+            
+            for i in range(self.start_layer, self.end_layer):
+                layer = self.layers[i]
+                hidden_states, residual = layer(positions, hidden_states,
+                                                kv_caches[i - self.start_layer],
+                                                attn_metadata, residual)
+            
+            if not get_pp_group().is_last_rank:
+                return IntermediateTensors({
+                    "hidden_states": hidden_states,
+                    "residual": residual
+                })
 
-        hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+            hidden_states, _ = self.norm(hidden_states, residual)
+            # if attn_metadata.prefill_metadata !=None:
+            #     pynvml.nvmlInit()
+            #     device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            #     torch.cuda.synchronize()
+            #     threading.Thread(target=set_gpu_clock,
+            #                         args=(device_handle, 1200, 1400)).start()
+                # pynvml.nvmlDeviceSetGpuLockedClocks(device_handle, 1200, 1400)
+            stop_event.record()
+            if attn_metadata.prefill_metadata==None:
+                decode_time_event_list.append((start_event,stop_event))
+                torch.cuda.synchronize()
+                decode_end_power = pynvml.nvmlDeviceGetPowerUsage(self.handle)
+                decode_energy.append((decode_start_power+decode_end_power)/2)
+                # print("pe:",decode_energy)
+            return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

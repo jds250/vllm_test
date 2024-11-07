@@ -96,24 +96,25 @@ def plot_data(data):
 
     # Prefill Attention Time vs Power
     plt.subplot(2, 2, 1)
+    # plt.plot(power, data['prefill_mlp_time'], marker='x', label='Prefill MLP Time')
     plt.plot(power, data['prefill_time'], marker='o', label='Prefill Attention Time')
+    plt.plot(power, data['decode_mlp_time'], marker='x', label='Decode MLP Time')
     plt.title('Prefill Attention Time vs Power')
-    plt.xlabel('Power')
+    plt.xlabel('Frequency')
     plt.ylabel('Prefill Time')
-
+    plt.legend()
     # Prefill MLP Time vs Power
-    plt.subplot(2, 2, 2)
-    plt.plot(power, data['prefill_mlp_time'], marker='o', label='Prefill MLP Time')
-    plt.title('Prefill MLP Time vs Power')
-    plt.xlabel('Power')
-    plt.ylabel('Prefill MLP Time')
+    # plt.subplot(2, 2, )
+    # plt.title('Prefill MLP Time vs Power')
+    # plt.xlabel('Frequency')
+    # plt.ylabel('Prefill MLP Time')
 
     # Decode Attention Time 和 Decode MLP Time vs Power
-    plt.subplot(2, 2, 3)
+    plt.subplot(2, 2, 2)
+    
     plt.plot(power, data['decode_time'], marker='o', label='Decode Attention Time')
-    plt.plot(power, data['decode_mlp_time'], marker='x', label='Decode MLP Time')
     plt.title('Decode Attention & MLP Time vs Power')
-    plt.xlabel('Power')
+    plt.xlabel('Frequency')
     plt.ylabel('Decode Time')
     plt.legend()
 
